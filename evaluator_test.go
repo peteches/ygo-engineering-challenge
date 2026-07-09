@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
+	"strings"
 	"sync"
 	"testing"
 
@@ -25,9 +27,11 @@ type evalKey struct {
 // so individual test functions just read from the cache — no redundant LLM calls.
 var testState struct {
 	sync.Once
-	client  *openai.Client
-	results map[evalKey]EvaluationResult
-	err     error
+	client       *openai.Client
+	hotels       []Hotel
+	results      map[evalKey]EvaluationResult
+	descriptions map[string]Descriptions // keyed by hotel name — reused by TestPromptVariants
+	err          error
 }
 
 func toGenerationFeedback(lang string, d Descriptions, r EvaluationResult) GenerationFeedback {
@@ -73,9 +77,11 @@ func setup(t *testing.T) map[evalKey]EvaluationResult {
 			testState.err = fmt.Errorf("parse hotels.json: %w", err)
 			return
 		}
+		testState.hotels = hotels
 
 		ctx := context.Background()
 		testState.results = make(map[evalKey]EvaluationResult)
+		testState.descriptions = make(map[string]Descriptions)
 		langs := []string{"de", "fr"}
 		gp := DefaultGeneratorPrompts()
 		ep := DefaultEvaluatorPrompts()
@@ -126,6 +132,7 @@ func setup(t *testing.T) map[evalKey]EvaluationResult {
 				}
 			}
 
+			testState.descriptions[h.Name] = d
 			for _, lang := range langs {
 				testState.results[evalKey{h.Name, lang}] = langResults[lang]
 			}
@@ -257,6 +264,115 @@ func TestCombinedScore(t *testing.T) {
 			}
 			if r.Combined < CombinedPassThreshold {
 				t.Errorf("combined %.2f < %.2f", r.Combined, CombinedPassThreshold)
+			}
+		})
+	}
+}
+
+// --- Prompt variant comparison ---
+
+// promptSlot describes one prompt parameter slot and how to apply a variant path to it.
+type promptSlot struct {
+	name      string
+	dir       string
+	isGen     bool // true = generator prompt; false = evaluator prompt
+	applyGen  func(*GeneratorPrompts, string)
+	applyEval func(*EvaluatorPrompts, string)
+}
+
+var promptSlots = []promptSlot{
+	{name: "gen_english", dir: "prompts/gen_english", isGen: true,
+		applyGen: func(gp *GeneratorPrompts, p string) { gp.English = p }},
+	{name: "gen_de", dir: "prompts/gen_de", isGen: true,
+		applyGen: func(gp *GeneratorPrompts, p string) { gp.German = p }},
+	{name: "gen_fr", dir: "prompts/gen_fr", isGen: true,
+		applyGen: func(gp *GeneratorPrompts, p string) { gp.French = p }},
+	{name: "refine_de", dir: "prompts/refine_de", isGen: true,
+		applyGen: func(gp *GeneratorPrompts, p string) { gp.RefineDE = p }},
+	{name: "refine_fr", dir: "prompts/refine_fr", isGen: true,
+		applyGen: func(gp *GeneratorPrompts, p string) { gp.RefineFR = p }},
+	{name: "eval_claim_extract", dir: "prompts/eval_claim_extract", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.ClaimExtract = p }},
+	{name: "eval_claim_verify", dir: "prompts/eval_claim_verify", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.ClaimVerify = p }},
+	{name: "eval_hallucination_extract", dir: "prompts/eval_hallucination_extract", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.HallucinationExtract = p }},
+	{name: "eval_hallucination_verify", dir: "prompts/eval_hallucination_verify", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.HallucinationVerify = p }},
+	{name: "eval_backtrans_translate", dir: "prompts/eval_backtrans_translate", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.BackTranslate = p }},
+	{name: "eval_backtrans_score", dir: "prompts/eval_backtrans_score", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.BackScore = p }},
+	{name: "eval_language_nativeness", dir: "prompts/eval_language_nativeness", isGen: false,
+		applyEval: func(ep *EvaluatorPrompts, p string) { ep.LanguageNativeness = p }},
+}
+
+// TestPromptVariants discovers every .md file in each prompt slot directory and runs
+// a sub-test per variant. Generator variants regenerate from scratch; evaluator variants
+// reuse descriptions cached by setup(). Only slots with more than one variant file are
+// interesting, but default.md is always included for baseline comparison.
+func TestPromptVariants(t *testing.T) {
+	setup(t) // ensure testState is populated
+	ctx := context.Background()
+	langs := []string{"de", "fr"}
+
+	for _, slot := range promptSlots {
+		slot := slot
+		variants := listPromptVariants(slot.dir)
+		if len(variants) <= 1 {
+			continue // only default.md — nothing to compare
+		}
+
+		t.Run(slot.name, func(t *testing.T) {
+			for _, variantPath := range variants {
+				variantPath := variantPath
+				variantName := strings.TrimSuffix(path.Base(variantPath), ".md")
+
+				t.Run(variantName, func(t *testing.T) {
+					for _, h := range testState.hotels {
+						h := h
+						var d Descriptions
+						var err error
+
+						if slot.isGen {
+							gp := DefaultGeneratorPrompts()
+							slot.applyGen(&gp, variantPath)
+							d, err = GenerateDescriptions(ctx, testState.client, h, Descriptions{}, nil, gp)
+							if err != nil {
+								t.Fatalf("generate %s: %v", h.Name, err)
+							}
+						} else {
+							d = testState.descriptions[h.Name]
+						}
+
+						for _, lang := range langs {
+							lang := lang
+							ep := DefaultEvaluatorPrompts()
+							if !slot.isGen {
+								slot.applyEval(&ep, variantPath)
+							}
+
+							r, err := Evaluate(ctx, testState.client, d, lang, ep)
+							if err != nil {
+								t.Fatalf("evaluate %s/%s: %v", h.Name, lang, err)
+							}
+
+							t.Run(h.Name+"/"+lang, func(t *testing.T) {
+								t.Logf("claimAccuracy=%.2f languageNativeness=%.2f combined=%.2f passed=%v",
+									r.ClaimAccuracy.Combined, r.LanguageNativeness.Combined, r.Combined, r.Passed)
+								if r.ClaimAccuracy.Combined < ClaimAccuracyThreshold {
+									t.Errorf("claimAccuracy %.2f < %.2f", r.ClaimAccuracy.Combined, ClaimAccuracyThreshold)
+								}
+								if r.LanguageNativeness.Combined < LanguageNativenessThreshold {
+									t.Errorf("languageNativeness %.2f < %.2f", r.LanguageNativeness.Combined, LanguageNativenessThreshold)
+								}
+								if r.Combined < CombinedPassThreshold {
+									t.Errorf("combined %.2f < %.2f", r.Combined, CombinedPassThreshold)
+								}
+							})
+						}
+					}
+				})
 			}
 		})
 	}
