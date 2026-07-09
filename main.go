@@ -30,7 +30,7 @@ func main() {
 		fmt.Printf("%s — %s, %s\n", hotel.Name, hotel.City, hotel.Country)
 		fmt.Printf("════════════════════════════════════════\n\n")
 
-		d, err := GenerateDescriptions(ctx, client, hotel, Descriptions{}, nil)
+		d, err := GenerateDescriptions(ctx, client, hotel, Descriptions{}, nil, DefaultGeneratorPrompts())
 		if err != nil {
 			log.Fatalf("generate %s: %v", hotel.Name, err)
 		}

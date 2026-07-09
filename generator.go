@@ -30,33 +30,27 @@ type GenerationFeedback struct {
 // When feedback is nil (first attempt), both languages are generated fresh.
 // When feedback is non-nil (refinement), only languages listed in feedback
 // are regenerated; the rest are copied unchanged from prev.
-func GenerateDescriptions(ctx context.Context, client *openai.Client, hotel Hotel, prev Descriptions, feedback []GenerationFeedback) (Descriptions, error) {
+func GenerateDescriptions(ctx context.Context, client *openai.Client, hotel Hotel, prev Descriptions, feedback []GenerationFeedback, prompts GeneratorPrompts) (Descriptions, error) {
 	model := defaultModel()
 
 	if feedback == nil {
-		return generateFresh(ctx, client, model, hotel)
+		return generateFresh(ctx, client, model, hotel, prompts)
 	}
-	return generateRefinement(ctx, client, model, hotel, prev, feedback)
+	return generateRefinement(ctx, client, model, hotel, prev, feedback, prompts)
 }
 
-func generateFresh(ctx context.Context, client *openai.Client, model string, hotel Hotel) (Descriptions, error) {
+func generateFresh(ctx context.Context, client *openai.Client, model string, hotel Hotel, prompts GeneratorPrompts) (Descriptions, error) {
 	hotelJSON, err := json.MarshalIndent(hotel, "", "  ")
 	if err != nil {
 		return Descriptions{}, err
 	}
 
-	promptEN := fmt.Sprintf(`You are a hotel copywriter. Given the hotel data below, write a compelling English marketing description (100–150 words). Choose the most interesting facts — you do not need to use every field.
-
-Return ONLY valid JSON in this exact shape:
-{
-  "description": "<the marketing text>",
-  "featured_facts": ["<fact 1>", "<fact 2>", ...]
-}
-
-The featured_facts list must enumerate, in plain English, every specific claim made in the description (one fact per item, no duplicates).
-
-Hotel data:
-%s`, string(hotelJSON))
+	promptEN, err := renderPrompt(prompts.English, map[string]any{
+		"HotelJSON": string(hotelJSON),
+	})
+	if err != nil {
+		return Descriptions{}, err
+	}
 
 	var enResult englishResult
 	if err := chatJSON(ctx, client, model, promptEN, &enResult); err != nil {
@@ -65,32 +59,26 @@ Hotel data:
 
 	factsJSON, _ := json.Marshal(enResult.FeaturedFacts)
 
-	promptDE := fmt.Sprintf(`You are a native German hotel copywriter. Write a marketing description for %s that reads as if written by a German native speaker for a German-speaking audience.
-
-You MUST convey ALL of the following facts, and NOTHING that is not in this list:
-%s
-
-Rules:
-- Use formal "Sie" address
-- Avoid literal translations and English calques; use natural German idioms
-- 100–150 words
-- Return ONLY the description text, no JSON, no headings`, hotel.Name, string(factsJSON))
+	promptDE, err := renderPrompt(prompts.German, map[string]any{
+		"HotelName": hotel.Name,
+		"FactsJSON": string(factsJSON),
+	})
+	if err != nil {
+		return Descriptions{}, err
+	}
 
 	deText, err := chat(ctx, client, model, promptDE)
 	if err != nil {
 		return Descriptions{}, fmt.Errorf("German generation: %w", err)
 	}
 
-	promptFR := fmt.Sprintf(`You are a native French hotel copywriter. Write a marketing description for %s that reads as if written by a French native speaker for a French-speaking audience.
-
-You MUST convey ALL of the following facts, and NOTHING that is not in this list:
-%s
-
-Rules:
-- Use formal "vous" address
-- Avoid literal translations and English calques; use natural French idioms
-- 100–150 words
-- Return ONLY the description text, no JSON, no headings`, hotel.Name, string(factsJSON))
+	promptFR, err := renderPrompt(prompts.French, map[string]any{
+		"HotelName": hotel.Name,
+		"FactsJSON": string(factsJSON),
+	})
+	if err != nil {
+		return Descriptions{}, err
+	}
 
 	frText, err := chat(ctx, client, model, promptFR)
 	if err != nil {
@@ -106,7 +94,7 @@ Rules:
 	}, nil
 }
 
-func generateRefinement(ctx context.Context, client *openai.Client, model string, hotel Hotel, prev Descriptions, feedback []GenerationFeedback) (Descriptions, error) {
+func generateRefinement(ctx context.Context, client *openai.Client, model string, hotel Hotel, prev Descriptions, feedback []GenerationFeedback, prompts GeneratorPrompts) (Descriptions, error) {
 	result := Descriptions{
 		Hotel:         hotel,
 		FeaturedFacts: prev.FeaturedFacts,
@@ -115,25 +103,18 @@ func generateRefinement(ctx context.Context, client *openai.Client, model string
 		FR:            prev.FR,
 	}
 
-	feedbackByLang := make(map[string]GenerationFeedback, len(feedback))
-	for _, fb := range feedback {
-		feedbackByLang[fb.Language] = fb
-	}
-
 	factsJSON, _ := json.Marshal(prev.FeaturedFacts)
 
-	type langConfig struct {
-		name      string
-		formal    string
-		idiomNote string
-	}
-	langCfg := map[string]langConfig{
-		"de": {"German", "Sie", "Avoid English calques; use natural German idioms"},
-		"fr": {"French", "vous", "Avoid English calques; use natural French idioms"},
+	refinePaths := map[string]string{
+		"de": prompts.RefineDE,
+		"fr": prompts.RefineFR,
 	}
 
-	for lang, fb := range feedbackByLang {
-		cfg := langCfg[lang]
+	for _, fb := range feedback {
+		refinePath, ok := refinePaths[fb.Language]
+		if !ok {
+			return Descriptions{}, fmt.Errorf("unsupported language for refinement: %s", fb.Language)
+		}
 
 		var problems []string
 		if len(fb.MissedClaims) > 0 {
@@ -151,36 +132,22 @@ func generateRefinement(ctx context.Context, client *openai.Client, model string
 			}
 		}
 
-		prompt := fmt.Sprintf(`You are a native %s hotel copywriter. You previously wrote this %s description:
-
-%s
-
-A quality check found these problems:
-%s
-
-Write a corrected %s description for %s that fixes every issue above.
-You must still convey exactly these facts (and nothing else):
-%s
-
-Rules:
-- Use formal "%s" address
-- %s
-- 100–150 words
-- Return ONLY the description text, no JSON, no headings`,
-			cfg.name, cfg.name,
-			fb.PreviousDescription,
-			strings.Join(problems, "\n"),
-			cfg.name, hotel.Name,
-			string(factsJSON),
-			cfg.formal,
-			cfg.idiomNote)
+		prompt, err := renderPrompt(refinePath, map[string]any{
+			"HotelName":           hotel.Name,
+			"PreviousDescription": fb.PreviousDescription,
+			"Problems":            strings.Join(problems, "\n"),
+			"FactsJSON":           string(factsJSON),
+		})
+		if err != nil {
+			return Descriptions{}, err
+		}
 
 		text, err := chat(ctx, client, model, prompt)
 		if err != nil {
-			return Descriptions{}, fmt.Errorf("%s refinement: %w", lang, err)
+			return Descriptions{}, fmt.Errorf("%s refinement: %w", fb.Language, err)
 		}
 
-		switch lang {
+		switch fb.Language {
 		case "de":
 			result.DE = text
 		case "fr":

@@ -11,16 +11,15 @@ import (
 // --- Claim Accuracy ---
 
 // scoreClaimCoverage implements metric 1a.
-// It extracts claims from the English description then verifies each one
-// against the foreign text.
-func scoreClaimCoverage(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language string) (float64, []string, error) {
+func scoreClaimCoverage(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language, extractPath, verifyPath string) (float64, []string, error) {
 	model := defaultModel()
 
-	extractPrompt := fmt.Sprintf(`Read this English hotel description and extract every specific factual claim it makes.
-Return ONLY a JSON array of short English strings, one claim per item. No duplicates. No vague generalities — only concrete facts.
-
-Description:
-%s`, englishDesc)
+	extractPrompt, err := renderPrompt(extractPath, map[string]any{
+		"Description": englishDesc,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
 
 	var claims []string
 	if err := chatJSON(ctx, client, model, extractPrompt, &claims); err != nil {
@@ -31,21 +30,14 @@ Description:
 	}
 
 	claimsJSON, _ := json.Marshal(claims)
-	verifyPrompt := fmt.Sprintf(`You are checking whether a %s hotel description covers a set of facts.
-
-For each claim in the list below, decide:
-  "yes"     — the %s description clearly states this fact
-  "partial" — the %s description mentions it but with less detail or a weaker form
-  "no"      — the %s description does not mention this fact
-
-Return ONLY a JSON array of objects in this exact shape, one per claim, in the same order:
-[{"claim": "...", "result": "yes|partial|no"}, ...]
-
-Claims to check:
-%s
-
-%s description to check:
-%s`, language, language, language, language, string(claimsJSON), language, foreignDesc)
+	verifyPrompt, err := renderPrompt(verifyPath, map[string]any{
+		"Language":   language,
+		"ClaimsJSON": string(claimsJSON),
+		"ForeignDesc": foreignDesc,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
 
 	type claimCheck struct {
 		Claim  string `json:"claim"`
@@ -72,17 +64,17 @@ Claims to check:
 }
 
 // scoreHallucinationPrecision implements metric 1b.
-// It extracts claims from the foreign description and checks each against
-// the original source hotel JSON.
-func scoreHallucinationPrecision(ctx context.Context, client *openai.Client, foreignDesc, language string, hotel Hotel) (float64, []string, error) {
+func scoreHallucinationPrecision(ctx context.Context, client *openai.Client, foreignDesc, language string, hotel Hotel, extractPath, verifyPath string) (float64, []string, error) {
 	model := defaultModel()
 	hotelJSON, _ := json.MarshalIndent(hotel, "", "  ")
 
-	extractPrompt := fmt.Sprintf(`Read this %s hotel description. Extract every specific factual claim it makes.
-Translate each claim to English. Return ONLY a JSON array of short English strings, one claim per item.
-
-%s description:
-%s`, language, language, foreignDesc)
+	extractPrompt, err := renderPrompt(extractPath, map[string]any{
+		"Language":   language,
+		"ForeignDesc": foreignDesc,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
 
 	var claims []string
 	if err := chatJSON(ctx, client, model, extractPrompt, &claims); err != nil {
@@ -93,21 +85,13 @@ Translate each claim to English. Return ONLY a JSON array of short English strin
 	}
 
 	claimsJSON, _ := json.Marshal(claims)
-	verifyPrompt := fmt.Sprintf(`You are fact-checking hotel marketing claims against the original hotel data.
-
-For each claim below, decide if it is supported by the hotel data:
-  "yes"     — clearly supported by the hotel data
-  "partial" — roughly supported but slightly exaggerated or imprecise
-  "no"      — not supported or contradicts the hotel data
-
-Return ONLY a JSON array in this shape, one per claim, in order:
-[{"claim": "...", "result": "yes|partial|no"}, ...]
-
-Hotel source data:
-%s
-
-Claims to fact-check:
-%s`, string(hotelJSON), string(claimsJSON))
+	verifyPrompt, err := renderPrompt(verifyPath, map[string]any{
+		"HotelJSON":  string(hotelJSON),
+		"ClaimsJSON": string(claimsJSON),
+	})
+	if err != nil {
+		return 0, nil, err
+	}
 
 	type claimCheck struct {
 		Claim  string `json:"claim"`
@@ -134,38 +118,29 @@ Claims to fact-check:
 }
 
 // scoreBackTranslation implements metric 1c.
-// It back-translates the foreign description to English then scores semantic
-// equivalence against the original English base.
-func scoreBackTranslation(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language string) (float64, string, error) {
+func scoreBackTranslation(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language, translatePath, scorePath string) (float64, string, error) {
 	model := defaultModel()
 
-	backPrompt := fmt.Sprintf(`Translate the following %s text to English. Produce a faithful translation — do not paraphrase or improve it.
-Return ONLY the translated text.
-
-%s text:
-%s`, language, language, foreignDesc)
+	backPrompt, err := renderPrompt(translatePath, map[string]any{
+		"Language":   language,
+		"ForeignDesc": foreignDesc,
+	})
+	if err != nil {
+		return 0, "", err
+	}
 
 	backTranslated, err := chat(ctx, client, model, backPrompt)
 	if err != nil {
 		return 0, "", fmt.Errorf("back-translation: %w", err)
 	}
 
-	scorePrompt := fmt.Sprintf(`Compare these two English hotel descriptions for semantic equivalence.
-Score them from 0 to 100:
-  100 — identical meaning, all facts match, same level of detail
-  80  — nearly identical, minor wording differences but all facts present
-  60  — same general content but some facts are softened, vague, or missing nuance
-  40  — significant meaning drift; some facts missing or changed
-  0   — very different
-
-Return ONLY valid JSON:
-{"score": <0-100>, "notes": "<brief explanation of differences>"}
-
-Original English:
-%s
-
-Back-translated English:
-%s`, englishDesc, backTranslated)
+	scorePrompt, err := renderPrompt(scorePath, map[string]any{
+		"EnglishDesc":    englishDesc,
+		"BackTranslated": backTranslated,
+	})
+	if err != nil {
+		return 0, "", err
+	}
 
 	var result struct {
 		Score float64 `json:"score"`
@@ -178,7 +153,7 @@ Back-translated English:
 }
 
 // EvaluateClaimAccuracy runs all three factual accuracy sub-metrics for one language.
-func EvaluateClaimAccuracy(ctx context.Context, client *openai.Client, d Descriptions, language string) (ClaimAccuracyResult, error) {
+func EvaluateClaimAccuracy(ctx context.Context, client *openai.Client, d Descriptions, language string, ep EvaluatorPrompts) (ClaimAccuracyResult, error) {
 	var foreignDesc string
 	switch language {
 	case "de":
@@ -189,17 +164,17 @@ func EvaluateClaimAccuracy(ctx context.Context, client *openai.Client, d Descrip
 		return ClaimAccuracyResult{}, fmt.Errorf("unsupported language: %s", language)
 	}
 
-	coverage, missed, err := scoreClaimCoverage(ctx, client, d.EN, foreignDesc, language)
+	coverage, missed, err := scoreClaimCoverage(ctx, client, d.EN, foreignDesc, language, ep.ClaimExtract, ep.ClaimVerify)
 	if err != nil {
 		return ClaimAccuracyResult{}, fmt.Errorf("1a: %w", err)
 	}
 
-	precision, hallucinated, err := scoreHallucinationPrecision(ctx, client, foreignDesc, language, d.Hotel)
+	precision, hallucinated, err := scoreHallucinationPrecision(ctx, client, foreignDesc, language, d.Hotel, ep.HallucinationExtract, ep.HallucinationVerify)
 	if err != nil {
 		return ClaimAccuracyResult{}, fmt.Errorf("1b: %w", err)
 	}
 
-	backTranslation, btNotes, err := scoreBackTranslation(ctx, client, d.EN, foreignDesc, language)
+	backTranslation, btNotes, err := scoreBackTranslation(ctx, client, d.EN, foreignDesc, language, ep.BackTranslate, ep.BackScore)
 	if err != nil {
 		return ClaimAccuracyResult{}, fmt.Errorf("1c: %w", err)
 	}
@@ -219,34 +194,20 @@ func EvaluateClaimAccuracy(ctx context.Context, client *openai.Client, d Descrip
 // --- Language Nativeness ---
 
 // EvaluateLanguageNativeness runs all four linguistic quality sub-metrics in a single LLM call.
-func EvaluateLanguageNativeness(ctx context.Context, client *openai.Client, description, language string) (LanguageNativenessResult, error) {
+func EvaluateLanguageNativeness(ctx context.Context, client *openai.Client, description, language string, ep EvaluatorPrompts) (LanguageNativenessResult, error) {
 	model := defaultModel()
 
 	langNames := map[string]string{"de": "German", "fr": "French"}
-	langName := langNames[language]
+	formalAddr := map[string]string{"de": "Sie", "fr": "vous"}
 
-	prompt := fmt.Sprintf(`You are an expert in %s hotel marketing copywriting. Evaluate the following %s description on four dimensions. Score each 1–10.
-
-Dimensions:
-1. register: Is the formality level appropriate for luxury hotel marketing in %s? (%s uses formal "%s" address; sophisticated vocabulary; no contractions)
-2. idiom: Does it use natural, idiomatic %s expressions, or does it contain calques (stilted literal translations from English)?
-3. flow: Does sentence structure follow natural %s patterns (word order, compound nouns, article use, rhythm)?
-4. cultural_resonance: Does the description appeal to what %s-speaking travellers value and find relevant?
-
-Return ONLY valid JSON in this exact shape:
-{
-  "register":           {"score": <1-10>, "notes": "<specific observations>"},
-  "idiom":              {"score": <1-10>, "notes": "<specific observations>"},
-  "flow":               {"score": <1-10>, "notes": "<specific observations>"},
-  "cultural_resonance": {"score": <1-10>, "notes": "<specific observations>"}
-}
-
-%s description to evaluate:
-%s`,
-		langName, langName, langName,
-		langName, map[string]string{"de": "Sie", "fr": "vous"}[language],
-		langName, langName, langName,
-		langName, description)
+	prompt, err := renderPrompt(ep.LanguageNativeness, map[string]any{
+		"LangName":      langNames[language],
+		"FormalAddress": formalAddr[language],
+		"Description":   description,
+	})
+	if err != nil {
+		return LanguageNativenessResult{}, err
+	}
 
 	var scores struct {
 		Register          SubScore `json:"register"`
@@ -269,7 +230,7 @@ Return ONLY valid JSON in this exact shape:
 }
 
 // Evaluate runs both evaluations for a single hotel+language pair.
-func Evaluate(ctx context.Context, client *openai.Client, d Descriptions, language string) (EvaluationResult, error) {
+func Evaluate(ctx context.Context, client *openai.Client, d Descriptions, language string, ep EvaluatorPrompts) (EvaluationResult, error) {
 	var foreignDesc string
 	switch language {
 	case "de":
@@ -280,12 +241,12 @@ func Evaluate(ctx context.Context, client *openai.Client, d Descriptions, langua
 		return EvaluationResult{}, fmt.Errorf("unsupported language: %s", language)
 	}
 
-	ca, err := EvaluateClaimAccuracy(ctx, client, d, language)
+	ca, err := EvaluateClaimAccuracy(ctx, client, d, language, ep)
 	if err != nil {
 		return EvaluationResult{}, fmt.Errorf("claim accuracy: %w", err)
 	}
 
-	ln, err := EvaluateLanguageNativeness(ctx, client, foreignDesc, language)
+	ln, err := EvaluateLanguageNativeness(ctx, client, foreignDesc, language, ep)
 	if err != nil {
 		return EvaluationResult{}, fmt.Errorf("language nativeness: %w", err)
 	}

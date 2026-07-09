@@ -77,9 +77,11 @@ func setup(t *testing.T) map[evalKey]EvaluationResult {
 		ctx := context.Background()
 		testState.results = make(map[evalKey]EvaluationResult)
 		langs := []string{"de", "fr"}
+		gp := DefaultGeneratorPrompts()
+		ep := DefaultEvaluatorPrompts()
 
 		for _, h := range hotels {
-			d, err := GenerateDescriptions(ctx, client, h, Descriptions{}, nil)
+			d, err := GenerateDescriptions(ctx, client, h, Descriptions{}, nil, gp)
 			if err != nil {
 				testState.err = fmt.Errorf("generate %s: %w", h.Name, err)
 				return
@@ -98,7 +100,7 @@ func setup(t *testing.T) map[evalKey]EvaluationResult {
 					if len(failingFeedback) == 0 {
 						break
 					}
-					d, err = GenerateDescriptions(ctx, client, h, d, failingFeedback)
+					d, err = GenerateDescriptions(ctx, client, h, d, failingFeedback, gp)
 					if err != nil {
 						testState.err = fmt.Errorf("regenerate %s attempt %d: %w", h.Name, attempt, err)
 						return
@@ -107,7 +109,7 @@ func setup(t *testing.T) map[evalKey]EvaluationResult {
 
 				allPassed := true
 				for _, lang := range langs {
-					r, err := Evaluate(ctx, client, d, lang)
+					r, err := Evaluate(ctx, client, d, lang, ep)
 					if err != nil {
 						testState.err = fmt.Errorf("evaluate %s/%s attempt %d: %w", h.Name, lang, attempt, err)
 						return
