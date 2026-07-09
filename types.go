@@ -29,16 +29,20 @@ type SubScore struct {
 	Notes string  `json:"notes"`
 }
 
-// Tier1Result holds scores for the three Tier 1 sub-metrics.
-type Tier1Result struct {
+// ClaimAccuracyResult holds scores for the three factual accuracy sub-metrics.
+type ClaimAccuracyResult struct {
 	ClaimCoverage          float64 // 1a
 	HallucinationPrecision float64 // 1b
 	BackTranslation        float64 // 1c
 	Combined               float64
+	// detail for feedback
+	MissedClaims         []string
+	HallucinatedClaims   []string
+	BackTranslationNotes string
 }
 
-// Tier2Result holds scores for the four Tier 2 sub-metrics.
-type Tier2Result struct {
+// LanguageNativenessResult holds scores for the four linguistic quality sub-metrics.
+type LanguageNativenessResult struct {
 	Register          SubScore `json:"register"`           // 2a
 	Idiom             SubScore `json:"idiom"`              // 2b
 	Flow              SubScore `json:"flow"`               // 2c
@@ -48,25 +52,25 @@ type Tier2Result struct {
 
 // EvaluationResult is the full evaluation for one hotel+language pair.
 type EvaluationResult struct {
-	HotelName string
-	Language  string
-	Tier1     Tier1Result
-	Tier2     Tier2Result
-	Combined  float64
-	Passed    bool
+	HotelName          string
+	Language           string
+	ClaimAccuracy      ClaimAccuracyResult
+	LanguageNativeness LanguageNativenessResult
+	Combined           float64
+	Passed             bool
 }
 
 const (
-	Tier1PassThreshold    = 0.90
-	Tier2PassThreshold    = 0.70
-	CombinedPassThreshold = 0.85
+	ClaimAccuracyThreshold      = 0.90
+	LanguageNativenessThreshold = 0.70
+	CombinedPassThreshold       = 0.85
 )
 
-func tier1Combined(r Tier1Result) float64 {
+func claimAccuracyCombined(r ClaimAccuracyResult) float64 {
 	return r.ClaimCoverage*0.40 + r.HallucinationPrecision*0.35 + r.BackTranslation*0.25
 }
 
-func tier2Combined(r Tier2Result) float64 {
+func languageNativenessCombined(r LanguageNativenessResult) float64 {
 	return (r.Register.Score*0.25 + r.Idiom.Score*0.35 + r.Flow.Score*0.25 + r.CulturalResonance.Score*0.15) / 10.0
 }
 

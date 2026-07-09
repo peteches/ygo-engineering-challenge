@@ -8,7 +8,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-// --- Tier 1 ---
+// --- Claim Accuracy ---
 
 // scoreClaimCoverage implements metric 1a.
 // It extracts claims from the English description then verifies each one
@@ -16,7 +16,6 @@ import (
 func scoreClaimCoverage(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language string) (float64, []string, error) {
 	model := defaultModel()
 
-	// Step 1: extract claims from the English description
 	extractPrompt := fmt.Sprintf(`Read this English hotel description and extract every specific factual claim it makes.
 Return ONLY a JSON array of short English strings, one claim per item. No duplicates. No vague generalities — only concrete facts.
 
@@ -31,7 +30,6 @@ Description:
 		return 0, nil, fmt.Errorf("no claims extracted from English description")
 	}
 
-	// Step 2: verify each claim against the foreign description
 	claimsJSON, _ := json.Marshal(claims)
 	verifyPrompt := fmt.Sprintf(`You are checking whether a %s hotel description covers a set of facts.
 
@@ -80,7 +78,6 @@ func scoreHallucinationPrecision(ctx context.Context, client *openai.Client, for
 	model := defaultModel()
 	hotelJSON, _ := json.MarshalIndent(hotel, "", "  ")
 
-	// Step 1: extract claims from the foreign description (translated to English)
 	extractPrompt := fmt.Sprintf(`Read this %s hotel description. Extract every specific factual claim it makes.
 Translate each claim to English. Return ONLY a JSON array of short English strings, one claim per item.
 
@@ -92,10 +89,9 @@ Translate each claim to English. Return ONLY a JSON array of short English strin
 		return 0, nil, fmt.Errorf("foreign claim extraction: %w", err)
 	}
 	if len(claims) == 0 {
-		return 1.0, nil, nil // no claims = no hallucinations
+		return 1.0, nil, nil
 	}
 
-	// Step 2: verify each claim against the source hotel JSON
 	claimsJSON, _ := json.Marshal(claims)
 	verifyPrompt := fmt.Sprintf(`You are fact-checking hotel marketing claims against the original hotel data.
 
@@ -143,7 +139,6 @@ Claims to fact-check:
 func scoreBackTranslation(ctx context.Context, client *openai.Client, englishDesc, foreignDesc, language string) (float64, string, error) {
 	model := defaultModel()
 
-	// Step 1: back-translate
 	backPrompt := fmt.Sprintf(`Translate the following %s text to English. Produce a faithful translation — do not paraphrase or improve it.
 Return ONLY the translated text.
 
@@ -155,7 +150,6 @@ Return ONLY the translated text.
 		return 0, "", fmt.Errorf("back-translation: %w", err)
 	}
 
-	// Step 2: score semantic equivalence
 	scorePrompt := fmt.Sprintf(`Compare these two English hotel descriptions for semantic equivalence.
 Score them from 0 to 100:
   100 — identical meaning, all facts match, same level of detail
@@ -183,8 +177,8 @@ Back-translated English:
 	return result.Score / 100.0, result.Notes, nil
 }
 
-// EvaluateTier1 runs all three Tier 1 sub-metrics for one language.
-func EvaluateTier1(ctx context.Context, client *openai.Client, d Descriptions, language string) (Tier1Result, error) {
+// EvaluateClaimAccuracy runs all three factual accuracy sub-metrics for one language.
+func EvaluateClaimAccuracy(ctx context.Context, client *openai.Client, d Descriptions, language string) (ClaimAccuracyResult, error) {
 	var foreignDesc string
 	switch language {
 	case "de":
@@ -192,37 +186,40 @@ func EvaluateTier1(ctx context.Context, client *openai.Client, d Descriptions, l
 	case "fr":
 		foreignDesc = d.FR
 	default:
-		return Tier1Result{}, fmt.Errorf("unsupported language: %s", language)
+		return ClaimAccuracyResult{}, fmt.Errorf("unsupported language: %s", language)
 	}
 
-	coverage, _, err := scoreClaimCoverage(ctx, client, d.EN, foreignDesc, language)
+	coverage, missed, err := scoreClaimCoverage(ctx, client, d.EN, foreignDesc, language)
 	if err != nil {
-		return Tier1Result{}, fmt.Errorf("1a: %w", err)
+		return ClaimAccuracyResult{}, fmt.Errorf("1a: %w", err)
 	}
 
-	precision, _, err := scoreHallucinationPrecision(ctx, client, foreignDesc, language, d.Hotel)
+	precision, hallucinated, err := scoreHallucinationPrecision(ctx, client, foreignDesc, language, d.Hotel)
 	if err != nil {
-		return Tier1Result{}, fmt.Errorf("1b: %w", err)
+		return ClaimAccuracyResult{}, fmt.Errorf("1b: %w", err)
 	}
 
-	backTranslation, _, err := scoreBackTranslation(ctx, client, d.EN, foreignDesc, language)
+	backTranslation, btNotes, err := scoreBackTranslation(ctx, client, d.EN, foreignDesc, language)
 	if err != nil {
-		return Tier1Result{}, fmt.Errorf("1c: %w", err)
+		return ClaimAccuracyResult{}, fmt.Errorf("1c: %w", err)
 	}
 
-	r := Tier1Result{
+	r := ClaimAccuracyResult{
 		ClaimCoverage:          coverage,
 		HallucinationPrecision: precision,
 		BackTranslation:        backTranslation,
+		MissedClaims:           missed,
+		HallucinatedClaims:     hallucinated,
+		BackTranslationNotes:   btNotes,
 	}
-	r.Combined = tier1Combined(r)
+	r.Combined = claimAccuracyCombined(r)
 	return r, nil
 }
 
-// --- Tier 2 ---
+// --- Language Nativeness ---
 
-// EvaluateTier2 runs all four Tier 2 sub-metrics in a single LLM call.
-func EvaluateTier2(ctx context.Context, client *openai.Client, description, language string) (Tier2Result, error) {
+// EvaluateLanguageNativeness runs all four linguistic quality sub-metrics in a single LLM call.
+func EvaluateLanguageNativeness(ctx context.Context, client *openai.Client, description, language string) (LanguageNativenessResult, error) {
 	model := defaultModel()
 
 	langNames := map[string]string{"de": "German", "fr": "French"}
@@ -258,20 +255,20 @@ Return ONLY valid JSON in this exact shape:
 		CulturalResonance SubScore `json:"cultural_resonance"`
 	}
 	if err := chatJSON(ctx, client, model, prompt, &scores); err != nil {
-		return Tier2Result{}, fmt.Errorf("tier2 scoring: %w", err)
+		return LanguageNativenessResult{}, fmt.Errorf("language nativeness scoring: %w", err)
 	}
 
-	r := Tier2Result{
+	r := LanguageNativenessResult{
 		Register:          scores.Register,
 		Idiom:             scores.Idiom,
 		Flow:              scores.Flow,
 		CulturalResonance: scores.CulturalResonance,
 	}
-	r.Combined = tier2Combined(r)
+	r.Combined = languageNativenessCombined(r)
 	return r, nil
 }
 
-// Evaluate runs both tiers for a single hotel+language pair.
+// Evaluate runs both evaluations for a single hotel+language pair.
 func Evaluate(ctx context.Context, client *openai.Client, d Descriptions, language string) (EvaluationResult, error) {
 	var foreignDesc string
 	switch language {
@@ -283,27 +280,27 @@ func Evaluate(ctx context.Context, client *openai.Client, d Descriptions, langua
 		return EvaluationResult{}, fmt.Errorf("unsupported language: %s", language)
 	}
 
-	t1, err := EvaluateTier1(ctx, client, d, language)
+	ca, err := EvaluateClaimAccuracy(ctx, client, d, language)
 	if err != nil {
-		return EvaluationResult{}, fmt.Errorf("tier1: %w", err)
+		return EvaluationResult{}, fmt.Errorf("claim accuracy: %w", err)
 	}
 
-	t2, err := EvaluateTier2(ctx, client, foreignDesc, language)
+	ln, err := EvaluateLanguageNativeness(ctx, client, foreignDesc, language)
 	if err != nil {
-		return EvaluationResult{}, fmt.Errorf("tier2: %w", err)
+		return EvaluationResult{}, fmt.Errorf("language nativeness: %w", err)
 	}
 
-	combined := combinedScore(t1.Combined, t2.Combined)
-	passed := t1.Combined >= Tier1PassThreshold &&
-		t2.Combined >= Tier2PassThreshold &&
+	combined := combinedScore(ca.Combined, ln.Combined)
+	passed := ca.Combined >= ClaimAccuracyThreshold &&
+		ln.Combined >= LanguageNativenessThreshold &&
 		combined >= CombinedPassThreshold
 
 	return EvaluationResult{
-		HotelName: d.Hotel.Name,
-		Language:  language,
-		Tier1:     t1,
-		Tier2:     t2,
-		Combined:  combined,
-		Passed:    passed,
+		HotelName:          d.Hotel.Name,
+		Language:           language,
+		ClaimAccuracy:      ca,
+		LanguageNativeness: ln,
+		Combined:           combined,
+		Passed:             passed,
 	}, nil
 }
